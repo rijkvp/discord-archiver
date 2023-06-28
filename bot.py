@@ -58,7 +58,7 @@ cursor.execute("""
 CREATE TABLE IF NOT EXISTS attachments (
     message_id INTEGER NOT NULL,
     filename TEXT,
-    content_type TEXT NOT NULL,
+    content_type TEXT,
     data BLOB,
     FOREIGN KEY (message_id) REFERENCES messages(id)
 )""")
@@ -74,7 +74,7 @@ CREATE TABLE IF NOT EXISTS embeds (
     type INTEGER NOT NULL,
     title TEXT,
     description TEXT,
-    url TEXT NOT NULL,
+    url TEXT,
     data BLOB,
     FOREIGN KEY (message_id) REFERENCES messages(id),
     CHECK (type IN (0, 1, 2))
@@ -134,7 +134,7 @@ async def gather_with_concurrency(n, *coros):
     async def sem_coro(coro):
         async with semaphore:
             return await coro
-    return await asyncio.gather(*(sem_coro(c) for c in coros))
+    return await asyncio.gather(*[sem_coro(c) for c in coros])
 
 async def archive_guild(guild):
     logging.info('Archiving guild: {}'.format(guild.name))
@@ -144,8 +144,6 @@ async def archive_guild(guild):
         logging.debug('Member: {}#{} ({})'.format(member.name, member.discriminator, member.nick))
         cursor.execute('INSERT OR REPLACE INTO members VALUES (?, ?, ?, ?, ?, ?)', (member.id, guild.id, int(member.joined_at.timestamp()), member.name, member.discriminator, member.nick))
     connection.commit()
-
-    return
 
     # Archive all channels in parallel
     logging.info('Archiving channels concurrently ({}x)'.format(CONCURRENCY))
