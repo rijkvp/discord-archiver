@@ -1,4 +1,4 @@
-import datetime
+import asyncio
 import discord
 import logging
 import os
@@ -10,7 +10,8 @@ from enum import IntEnum
 load_dotenv()
 
 DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
-SQLITE_DB = os.getenv('SQLITE_DB')
+SQLITE_DB = os.getenv('SQLITE_DB', 'discord.sqlite')
+CONCURRENCY = int(os.getenv('CONCURRENCY', 6))
 DATE_FMT = '%Y-%m-%d %H:%M:%S'
 
 logging.basicConfig(format='%(levelname)s %(message)s',
@@ -20,12 +21,23 @@ connection = sqlite3.connect(SQLITE_DB)
 cursor = connection.cursor()
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS guilds (
-    id INTEGER,
+    id INTEGER NOT NULL,
     name TEXT
 )""")
 cursor.execute("""
+CREATE TABLE IF NOT EXISTS members (
+    id INTEGER NOT NULL,
+    guild_id INTEGER NOT NULL,
+    joined_at INTEGER NOT NULL,
+    name TEXT,
+    discriminator INTEGER,
+    nick TEXT,
+    PRIMARY KEY (id, guild_id),
+    FOREIGN KEY (guild_id) REFERENCES guilds(id)
+)""")
+cursor.execute("""
 CREATE TABLE IF NOT EXISTS channels (
-    id INTEGER,
+    id INTEGER NOT NULL,
     name TEXT,
     guild_id INTEGER,
     PRIMARY KEY (id),
@@ -33,10 +45,10 @@ CREATE TABLE IF NOT EXISTS channels (
 )""")
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER,
-    channel_id INTEGER,
-    created_at INTEGER,
-    author_id INTEGER,
+    id INTEGER NOT NULL,
+    channel_id INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    author_id INTEGER NOT NULL,
     user_name TEXT,
     content TEXT,
     PRIMARY KEY (id),
@@ -44,9 +56,9 @@ CREATE TABLE IF NOT EXISTS messages (
 )""")
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS attachments (
-    message_id INTEGER,
+    message_id INTEGER NOT NULL,
     filename TEXT,
-    content_type TEXT,
+    content_type TEXT NOT NULL,
     data BLOB,
     FOREIGN KEY (message_id) REFERENCES messages(id)
 )""")
@@ -58,11 +70,11 @@ class EmbedType(IntEnum):
     Video = 2
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS embeds (
-    message_id INTEGER,
-    type INTEGER,
+    message_id INTEGER NOT NULL,
+    type INTEGER NOT NULL,
     title TEXT,
     description TEXT,
-    url TEXT,
+    url TEXT NOT NULL,
     data BLOB,
     FOREIGN KEY (message_id) REFERENCES messages(id),
     CHECK (type IN (0, 1, 2))
@@ -70,6 +82,7 @@ CREATE TABLE IF NOT EXISTS embeds (
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 client = discord.Client(intents=intents)
 
 async def download_attachment(msg, attachment):
@@ -81,23 +94,21 @@ async def download_attachment(msg, attachment):
     cursor.execute('INSERT OR REPLACE INTO attachments VALUES (?, ?, ?, ?)', (msg.id, attachment.filename, attachment.content_type, attachment_data))
 
 async def download_file(url):
-    logging.debug('Download file: {}'.format(url))
+    logging.info('Download file: {}'.format(url))
+    request = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 (X11; Linux i686; rv:109.0) Gecko/20100101 Firefox/114.0'})
     try:
-        # TODO: Add fake user agent to avoid 403
-        with urllib.request.urlopen(url) as response:
+        with urllib.request.urlopen(request) as response:
             return response.read()
     except Exception as e:
         logging.error('Failed to download file {} : {}'.format(url, e))
         return None
 
 async def archive_channel(channel):
-    now = datetime.datetime.now()
-
-    logging.info('Archiving channel: {}'.format(channel.name))
+    logging.info('Start archiving channel: #{}'.format(channel.name))
     cursor.execute('INSERT OR REPLACE INTO channels VALUES (?, ?, ?)',
                    (channel.id, channel.name, channel.guild.id))
     connection.commit()
-    async for msg in channel.history(limit=20, before=now, oldest_first=True):
+    async for msg in channel.history(limit=None, oldest_first=True):
         logging.debug('[{}] {}: {}'.format(msg.created_at.strftime(DATE_FMT), msg.author.name, msg.content))
         cursor.execute('INSERT OR REPLACE INTO messages VALUES (?, ?, ?, ?, ?, ?)',
                        (msg.id, msg.channel.id, int(msg.created_at.timestamp()), msg.author.id, msg.author.name, msg.clean_content))
@@ -107,7 +118,7 @@ async def archive_channel(channel):
             if embed.type == 'gifv':
                 # the 'gifv' type is a gif as a video, the size is probably very small so we just download it
                 embed_type = EmbedType.Video
-                embed_data = await download_file(embed.url)
+                embed_data = await download_file(embed.video.url)
             elif embed.type == 'image':
                 embed_type = EmbedType.Image
                 embed_data = await download_file(embed.url)
@@ -117,13 +128,28 @@ async def archive_channel(channel):
             cursor.execute('INSERT OR REPLACE INTO embeds VALUES (?, ?, ?, ?, ?, ?)', (msg.id, int(embed_type), embed.title, embed.description, embed.url, embed_data))
         connection.commit()
 
+async def gather_with_concurrency(n, *coros):
+    semaphore = asyncio.Semaphore(n)
+
+    async def sem_coro(coro):
+        async with semaphore:
+            return await coro
+    return await asyncio.gather(*(sem_coro(c) for c in coros))
+
 async def archive_guild(guild):
     logging.info('Archiving guild: {}'.format(guild.name))
     cursor.execute('INSERT OR REPLACE INTO guilds VALUES (?, ?)', (guild.id, guild.name))
+    logging.info('Updating {} members'.format(guild.member_count))
+    async for member in guild.fetch_members(limit=None):
+        logging.debug('Member: {}#{} ({})'.format(member.name, member.discriminator, member.nick))
+        cursor.execute('INSERT OR REPLACE INTO members VALUES (?, ?, ?, ?, ?, ?)', (member.id, guild.id, int(member.joined_at.timestamp()), member.name, member.discriminator, member.nick))
     connection.commit()
-    for text_channel in guild.text_channels:
-        await archive_channel(text_channel)
 
+    return
+
+    # Archive all channels in parallel
+    logging.info('Archiving channels concurrently ({}x)'.format(CONCURRENCY))
+    await gather_with_concurrency(CONCURRENCY, *[archive_channel(text_channel) for text_channel in guild.text_channels])
 
 @client.event
 async def on_ready():
