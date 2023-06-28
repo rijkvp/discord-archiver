@@ -3,7 +3,9 @@ import discord
 import logging
 import os
 import sqlite3
+import urllib.request
 from dotenv import load_dotenv
+from enum import IntEnum
 
 load_dotenv()
 
@@ -48,14 +50,22 @@ CREATE TABLE IF NOT EXISTS attachments (
     data BLOB,
     FOREIGN KEY (message_id) REFERENCES messages(id)
 )""")
+
+# Embed type: 0: other, 1: image (downloaded), 2: video (downloaded)
+class EmbedType(IntEnum):
+    Other = 0
+    Image = 1
+    Video = 2
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS embeds (
     message_id INTEGER,
-    type TEXT,
+    type INTEGER,
     title TEXT,
     description TEXT,
     url TEXT,
-    FOREIGN KEY (message_id) REFERENCES messages(id)
+    data BLOB,
+    FOREIGN KEY (message_id) REFERENCES messages(id),
+    CHECK (type IN (0, 1, 2))
 )""")
 
 intents = discord.Intents.default()
@@ -63,12 +73,22 @@ intents.message_content = True
 client = discord.Client(intents=intents)
 
 async def download_attachment(msg, attachment):
-    logging.info('Download attachment: {}'.format(attachment.url))
+    logging.debug('Download attachment: {}'.format(attachment.url))
     try:
         attachment_data = await attachment.read()
     except Exception as e:
         logging.error('Failed to download attachment {} : {}'.format(attachment.url, e))
     cursor.execute('INSERT OR REPLACE INTO attachments VALUES (?, ?, ?, ?)', (msg.id, attachment.filename, attachment.content_type, attachment_data))
+
+async def download_file(url):
+    logging.debug('Download file: {}'.format(url))
+    try:
+        # TODO: Add fake user agent to avoid 403
+        with urllib.request.urlopen(url) as response:
+            return response.read()
+    except Exception as e:
+        logging.error('Failed to download file {} : {}'.format(url, e))
+        return None
 
 async def archive_channel(channel):
     now = datetime.datetime.now()
@@ -84,11 +104,18 @@ async def archive_channel(channel):
         for attachment in msg.attachments:
             await download_attachment(msg, attachment)
         for embed in msg.embeds:
-            if embed.type == 'gifv' or embed.type == 'image':
-                # TODO: Download image/gif embeds
-                url = embed.url if embed.type == 'image' else embed.video.url
-            cursor.execute('INSERT OR REPLACE INTO embeds VALUES (?, ?, ?, ?, ?)', (msg.id, embed.type, embed.title, embed.description, embed.url))
-    connection.commit()
+            if embed.type == 'gifv':
+                # the 'gifv' type is a gif as a video, the size is probably very small so we just download it
+                embed_type = EmbedType.Video
+                embed_data = await download_file(embed.url)
+            elif embed.type == 'image':
+                embed_type = EmbedType.Image
+                embed_data = await download_file(embed.url)
+            else:
+                embed_type = EmbedType.Other
+                embed_data = None
+            cursor.execute('INSERT OR REPLACE INTO embeds VALUES (?, ?, ?, ?, ?, ?)', (msg.id, int(embed_type), embed.title, embed.description, embed.url, embed_data))
+        connection.commit()
 
 async def archive_guild(guild):
     logging.info('Archiving guild: {}'.format(guild.name))
