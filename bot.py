@@ -4,6 +4,7 @@ import logging
 import os
 import sqlite3
 import urllib.request
+import datetime
 from dotenv import load_dotenv
 from enum import IntEnum
 
@@ -13,6 +14,8 @@ DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
 SQLITE_DB = os.getenv('SQLITE_DB', 'discord.sqlite')
 CONCURRENCY = int(os.getenv('CONCURRENCY', 6))
 DATE_FMT = '%Y-%m-%d %H:%M:%S'
+AFTER = os.getenv('AFTER', '2020-01-01 00:00:00')
+INTERVAL_SIZE = int(os.getenv('INTERVAL_SIZE', 60))
 
 logging.basicConfig(format='%(levelname)s %(message)s',
                     datefmt=DATE_FMT, level=logging.INFO)
@@ -22,7 +25,8 @@ cursor = connection.cursor()
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS guilds (
     id INTEGER NOT NULL,
-    name TEXT
+    name TEXT,
+    PRIMARY KEY (id)
 )""")
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS members (
@@ -68,6 +72,7 @@ class EmbedType(IntEnum):
     Other = 0
     Image = 1
     Video = 2
+
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS embeds (
     message_id INTEGER NOT NULL,
@@ -103,12 +108,8 @@ async def download_file(url):
         logging.error('Failed to download file {} : {}'.format(url, e))
         return None
 
-async def archive_channel(channel):
-    logging.info('Start archiving channel: #{}'.format(channel.name))
-    cursor.execute('INSERT OR REPLACE INTO channels VALUES (?, ?, ?)',
-                   (channel.id, channel.name, channel.guild.id))
-    connection.commit()
-    async for msg in channel.history(limit=None, oldest_first=True):
+async def archive_channel_interval(channel, interval_start, interval_end):
+    async for msg in channel.history(limit=None, after=interval_start, before=interval_end):
         logging.debug('[{}] {}: {}'.format(msg.created_at.strftime(DATE_FMT), msg.author.name, msg.content))
         cursor.execute('INSERT OR REPLACE INTO messages VALUES (?, ?, ?, ?, ?, ?)',
                        (msg.id, msg.channel.id, int(msg.created_at.timestamp()), msg.author.id, msg.author.name, msg.clean_content))
@@ -127,6 +128,20 @@ async def archive_channel(channel):
                 embed_data = None
             cursor.execute('INSERT OR REPLACE INTO embeds VALUES (?, ?, ?, ?, ?, ?)', (msg.id, int(embed_type), embed.title, embed.description, embed.url, embed_data))
         connection.commit()
+
+async def archive_channel(channel):
+    logging.info('Start archiving channel: #{}'.format(channel.name))
+    cursor.execute('INSERT OR REPLACE INTO channels VALUES (?, ?, ?)',
+                   (channel.id, channel.name, channel.guild.id))
+    connection.commit()
+
+    interval_start = channel.created_at
+    interval_end = interval_start + datetime.timedelta(days=INTERVAL_SIZE)
+    while interval_start < datetime.datetime.now(interval_start.tzinfo):
+        logging.info('Archiving interval: {} - {}'.format(interval_start.strftime(DATE_FMT), interval_end.strftime(DATE_FMT)))
+        await archive_channel_interval(channel, interval_start, interval_end)
+        interval_start = interval_end
+        interval_end = interval_start + datetime.timedelta(days=INTERVAL_SIZE)
 
 async def gather_with_concurrency(n, *coros):
     semaphore = asyncio.Semaphore(n)

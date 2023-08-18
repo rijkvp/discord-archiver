@@ -15,6 +15,7 @@
             python311
             python311Packages.discordpy
             python311Packages.python-dotenv
+            python311Packages.jinja2
             discordchatexporter-cli
           ];
         };
